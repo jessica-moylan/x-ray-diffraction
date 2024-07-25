@@ -30,17 +30,18 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(DEVICE)
 PATCH_SIZE = 32
 STRIDE = 1
-BATCH_SIZE = 2
+BATCH_SIZE = 45000
 NUM_EPOCHS = 5
-NUM_WORKERS = 4
+NUM_WORKERS = 2
 IMAGE_HEIGHT =  1043 #1043 
 IMAGE_WIDTH = 981
 PIN_MEMORY = True
-LOAD_MODEL = True
+LOAD_MODEL = False
 TRAIN_IMG_DIR = "/home/jessica/Project-Code/x-ray-diffraction/diffraction_data/train_image"
 TRAIN_MASK_DIR = "/home/jessica/Project-Code/x-ray-diffraction/diffraction_data/train_label"
 VALIDATION_IMG_DIR = "/home/jessica/Project-Code/x-ray-diffraction/diffraction_data/val_image"
 VALIDATION_MASK_DIR = "/home/jessica/Project-Code/x-ray-diffraction/diffraction_data/val_label"
+
 
 """
     When looking at the model for how a UNET architecture is set up, we see that for all of the "steps" the image gets 
@@ -104,6 +105,7 @@ class UNET(nn.Module):
         self.bottleneck = DoubleConv(features[-1], features[-1]*2)
         #final convolution on the top right which keeps the same size of the image but decreaes the out_channels which would provide our final predicted result
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        self.final_relu = nn.ReLU() 
 
     def forward(self, x):
         skip_connections = []
@@ -127,17 +129,17 @@ class UNET(nn.Module):
             concat_skip = torch.cat((skip_connection, x), dim=1)
             x = self.ups[idx+1](concat_skip) #double convolutopm
 
-        return self.final_conv(x)
+        x = self.final_conv(x)
+        return self.final_relu(x)
     
 class CarDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, patch_size, stride, transform = None, patches = None, resize = None):
+    def __init__(self, image_dir, mask_dir, patch_size, stride, transform = None, patches = None):
         self.image_dir   = image_dir
         self.mask_dir    = mask_dir
         self.transform   = transform
         self.patches     = patches
         self.patch_size  = patch_size
         self.stride      = stride
-        self.resize      = resize
         #list all files that are in that folder
         self.images      = os.listdir(image_dir)
 
@@ -157,24 +159,11 @@ class CarDataset(Dataset):
         image = image[0:256, 159:159+256]
         mask = mask[0:256, 159:159+256]
 
-        if self.resize is not None:
-            # target_height = self.resize[0]
-            # target_width = self.resize[1]
-            # current_height, current_width = image.shape
+        if self.transform is not None:
+            augumentation = self.transform(image = image, mask = mask)
+            image = augumentation["image"]
+            mask = augumentation["mask"]
 
-            # pad_height = target_height - current_height
-            # pad_width = target_width - current_width
-
-            # # Calculate padding sizes
-            # top_pad = pad_height // 2
-            # bottom_pad = pad_height - top_pad
-            # left_pad = pad_width // 2
-            # right_pad = pad_width - left_pad
-
-            # # Pad the image
-            # image = np.pad(image, ((top_pad, bottom_pad), (left_pad, right_pad)), mode='constant')
-            # mask = np.pad(mask, ((top_pad, bottom_pad), (left_pad, right_pad)), mode='constant')
-            pass
 
         if self.patches is not None:
             image = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)
@@ -184,6 +173,29 @@ class CarDataset(Dataset):
 
         return [image, mask] 
     
+ALPHA = 0.8
+GAMMA = 2
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, size_average=True):
+        super(FocalLoss, self).__init__()
+
+    def forward(self, inputs, targets, alpha=ALPHA, gamma=GAMMA, smooth=1):
+        
+        #comment out if your model contains a sigmoid or equivalent activation layer
+        inputs = F.sigmoid(inputs)       
+        
+        #flatten label and prediction tensors
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+        
+        #first compute binary cross-entropy 
+        BCE = F.binary_cross_entropy_with_logits(inputs, targets, reduction='mean')
+        BCE_EXP = torch.exp(-BCE)
+        focal_loss = alpha * (1-BCE_EXP)**gamma * BCE
+                       
+        return focal_loss
+    
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
     print("=> Saving checkpoint")
     torch.save(state, filename)
@@ -192,24 +204,52 @@ def load_checkpoint(checkpoint, model):
     print("=> Loading checkpoint")
     model.load_state_dict(checkpoint["state_dict"])
 
-train_ds = CarDataset(image_dir=TRAIN_IMG_DIR, mask_dir=TRAIN_MASK_DIR, transform= None, patches = True, patch_size=PATCH_SIZE, stride = STRIDE)
-val_ds = CarDataset(image_dir=VALIDATION_IMG_DIR,mask_dir=VALIDATION_MASK_DIR, transform=None, patches = True, patch_size=PATCH_SIZE, stride = STRIDE)
+train_transform = A.Compose(
+        [
+            A.Normalize(
+                mean=[0.0],
+                std=[1.0],
+            ),
+        ],
+    )
+
+val_transforms = A.Compose(
+        [
+            A.Normalize(
+                mean=[0.0, 0.0, 0.0],
+                std=[1.0, 1.0, 1.0],
+            ),
+        ],
+    )
+
+train_ds = CarDataset(image_dir=TRAIN_IMG_DIR, mask_dir=TRAIN_MASK_DIR, transform= train_transform, patches = True, patch_size=PATCH_SIZE, stride = STRIDE)
+val_ds = CarDataset(image_dir=VALIDATION_IMG_DIR,mask_dir=VALIDATION_MASK_DIR, transform=val_transforms, patches = True, patch_size=PATCH_SIZE, stride = STRIDE)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, shuffle=True)
 val_loader = DataLoader(val_ds,batch_size=BATCH_SIZE,num_workers=NUM_WORKERS,pin_memory=PIN_MEMORY,shuffle=False)
 
 model = UNET(in_channels=1, out_channels=1).to(DEVICE) #if we wanted multisegmentation, we would change the number of output channels to the correct number of "classes"
-#binary cross entropy - we choose this beacuse we are not doing sigmoid for the output
-loss_fn = nn.BCEWithLogitsLoss() #we would change this to CEEithLogitsLoss() if multi classes
+#=================================================================
+torch.cuda.empty_cache()
+# del model
+#=================================================================
+
+
+#binary cross entropy - we choose this beacuse we are not doing sigmoid for the output  # Example weights: 0.1 for background, 0.9 for areas of interest
+# loss_fn = nn.BCELoss()  
+loss_fn = FocalLoss() #we would change this to CEEithLogitsLoss() if multi classes
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 scaler = torch.cuda.amp.GradScaler()
 print(model)
+
 
 if LOAD_MODEL:
         load_checkpoint(torch.load("my_checkpoint.pth.tar"), model)
 
 #train the model
-def train_fn(train_data, model, optimizer, loss, scaler, device):
+def train_fn(train_data, model, optimizer, loss_fn, scaler, device):
+    model.train()
     loop = tqdm(train_data)
+    running_loss = 0.0
     for _, (image_batch, mask_batch) in enumerate(loop):
         for batch_image, batch_mask in zip(image_batch, mask_batch):
             batch_image = batch_image.contiguous().view(-1, PATCH_SIZE, PATCH_SIZE)
@@ -219,33 +259,42 @@ def train_fn(train_data, model, optimizer, loss, scaler, device):
                 img_patch = img_patch.unsqueeze(0).unsqueeze(0).float().to(device)
                 mask_patch = mask_patch.unsqueeze(0).unsqueeze(0).to(device)
 
-                #going forwards in the model
-                with torch.cuda.amp.autocast(): #ueses float16
-                    predicted = model(img_patch)
-                    loss = loss_fn(predicted, mask_patch)
+                with torch.cuda.amp.autocast():
+                    # img_patch = nor_data(img_patch) #use pytorch's instead
+                    #convert back to tensor
+                    # print("img: " + str(img_patch))
 
-                #back progagation
-                optimizer.zero_grad() #zeros the gradients from the previous
+                    predicted = model(img_patch)
+                    # print(predicted)
+                    #only for use in BCECrossEntropyLogit
+                    # predicted = torch.sigmoid(predicted)
+                    loss = loss_fn(predicted, mask_patch)
+                    # print("loss: " + str(loss))
+
+                optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
-                #update tqdm loop
-                loop.set_postfix(loss = loss.item())
+                running_loss += loss.item()
 
-#see how good the model is #not correct anymore
+                loop.set_postfix(loss=loss.item())
+
+    average_loss = running_loss / len(train_data)
+    print(f'Average loss: {average_loss}')
+    return average_loss
+
 def accuracy_of_model(loader, model, device="cuda"):
     model.eval()
+    num_correct = 0
+    num_pixels = 0
+    dice_score = 0
     with torch.no_grad():
         for _, (batch_of_images, batch_of_masks) in enumerate(loader):
             for batch_image, batch_mask in zip(batch_of_images, batch_of_masks):
-                num_correct = 0
-                num_pixels = 0
-                dice_score = 0
-
                 batch_image = batch_image.contiguous().view(-1, PATCH_SIZE, PATCH_SIZE)
                 batch_mask = batch_mask.contiguous().view(-1, PATCH_SIZE, PATCH_SIZE)
-                
+
                 for img_patch, mask_patch in zip(batch_image, batch_mask):
                     img_patch = img_patch.unsqueeze(0).unsqueeze(0).float().to(device)
                     mask_patch = mask_patch.unsqueeze(0).unsqueeze(0).to(device)
@@ -253,13 +302,14 @@ def accuracy_of_model(loader, model, device="cuda"):
                     preds = torch.sigmoid(model(img_patch))
                     preds = (preds > 0.5).float()
 
-                    num_correct += (preds == mask_patch).sum() #sums all of the pixels
-                    num_pixels += torch.numel(preds) #gets the number of pixels
-                    dice_score += (2 * (preds * mask_patch).sum()) / ( (preds + mask_patch).sum() + 1e-8 ) # a better way of seeing how accurate your prediction is. This is needed since if it makes it all bblack pixels it would be auto 80% correct --> just for binary
-
-                print(f"Got {num_correct}/{num_pixels} with acc {num_correct/num_pixels*100:.2f} for image group")
-                print(f"Dice score for group: {dice_score/len(loader)}")
-    model.train()
+                    num_correct += (preds == mask_patch).sum()
+                    num_pixels += torch.numel(preds)
+                    dice_score += (2 * (preds * mask_patch).sum()) / ((preds + mask_patch).sum() + 1e-8)
+            print(f"Got {num_correct}/{num_pixels} with acc {num_correct/num_pixels*100:.2f} for image group")
+            print(f"Dice score for group: {dice_score/len(loader)}")
+    accuracy = num_correct / num_pixels * 100
+    dice_score = dice_score / len(loader)
+    return accuracy, dice_score
         
 def get_original_image_size(patch_tensor, patch_size, stride):
     _, num_patches_h, num_patches_w, _, _ = patch_tensor.size()
@@ -301,6 +351,7 @@ def save_predictions_as_images(loader, model, patch_size, stride, device="cuda")
         reconstruct_patches(image.cpu().numpy(), original_image_size, stride, index)
     
     model.train()
+    return
 
 def reconstruct_patches(patches, image, stride, index):
     """
@@ -349,14 +400,78 @@ def reconstruct_patches(patches, image, stride, index):
     tifffile.imwrite(str_test, img.astype(np.float32) )
     return 
 
-accuracy_of_model(val_loader, model, device = DEVICE)
-for epochs in range(NUM_EPOCHS): #how many times do we want to train?
-    # save model
-    checkpoint = {
-        "state_dict": model.state_dict(),
-        "optimizer":optimizer.state_dict(),
-    }
-    save_checkpoint(checkpoint)
-    train_fn(train_loader, model, optimizer, loss_fn, scaler, device = DEVICE)
+# accuracy_of_model(val_loader, model, device = DEVICE)
+# for epochs in range(NUM_EPOCHS): #how many times do we want to train?
+#     # save model
+#     checkpoint = {
+#         "state_dict": model.state_dict(),
+#         "optimizer":optimizer.state_dict(),
+#     }
+#     save_checkpoint(checkpoint)
+#     train_fn(train_loader, model, optimizer, loss_fn, scaler, device = DEVICE)
+#     accuracy_of_model(val_loader, model, device = DEVICE)
+# save_predictions_as_images(val_loader, model = model, patch_size = PATCH_SIZE, stride = STRIDE, device=DEVICE)
+
+def main():
+    print("enter main")
+    train_losses = []
+    val_accuracies = []
+    val_dice_scores = []
+
     accuracy_of_model(val_loader, model, device = DEVICE)
-save_predictions_as_images(val_loader, model = model, patch_size = PATCH_SIZE, stride = STRIDE, device=DEVICE)
+    for epoch in range(NUM_EPOCHS):
+        print(f"Epoch [{epoch}/{NUM_EPOCHS}]")
+        checkpoint = {
+            "state_dict": model.state_dict(),
+            "optimizer":optimizer.state_dict(),
+        }
+        save_checkpoint(checkpoint)
+        # Train
+        print(DEVICE)
+        train_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler, DEVICE)
+        train_losses.append(train_loss)
+
+        # Validate
+        val_accuracy, val_dice_score = accuracy_of_model(val_loader, model, DEVICE)
+        val_accuracies.append(val_accuracy.cpu())
+        val_dice_scores.append(val_dice_score)
+
+        print(f"Validation Accuracy: {val_accuracy:.2f}%")
+        print(f"Dice Score: {val_dice_score:.4f}")
+
+    save_predictions_as_images(val_loader, model = model, patch_size = PATCH_SIZE, stride = STRIDE, device=DEVICE)
+
+    print(train_losses, val_accuracies, val_dice_scores)
+    # fig, axes = plt.subplots(1, 1, figsize=(10, 15))
+    plt.figure()
+    plt.plot(range(NUM_EPOCHS), train_losses, label="Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Over Time")
+    plt.legend()
+    plt.show()
+    
+    # axes[0].plot(range(0, NUM_EPOCHS), train_losses, label="Training Loss")
+    # axes[0].set_xlabel("Epoch")
+    # axes[0].set_ylabel("Loss")
+    # axes[0].set_title("Training Loss Over Time")
+    # axes[0].legend()
+
+    # axes[1].plot(range(NUM_EPOCHS), val_accuracies, label="Validation Accuracy")
+    # axes[1].set_xlabel("Epoch")
+    # axes[1].set_ylabel("Accuracy (%)")
+    # axes[1].set_title("Validation Accuracy Over Time")
+    # axes[1].legend()
+
+    # axes[2].plot(range(NUM_EPOCHS), val_dice_scores, label="Dice Score")
+    # axes[2].set_xlabel("Epoch")
+    # axes[2].set_ylabel("Dice Score")
+    # axes[2].set_title("Validation Dice Score Over Time")
+    # axes[2].legend()
+
+    # plt.tight_layout()
+    # plt.show()
+
+
+if __name__ == "__main__":
+    main()
